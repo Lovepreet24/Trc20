@@ -6,6 +6,7 @@ const API_BASE = "https://apilist.tronscanapi.com";
 const USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const USDT_DECIMALS = 6;
 const ADMIN_ID = 7982111846;
+const MAX_PAYMENT_AGE_MS = 60_000;
 
 const config = {
   apiKey: process.env.TRONSCAN_API_KEY,
@@ -23,6 +24,10 @@ const config = {
   )
 };
 
+if (!config.databaseUrl || !config.botToken) {
+  throw new Error("DATABASE_URL and TELEGRAM_BOT_TOKEN are required");
+}
+
 const pool = new Pool({
   connectionString: config.databaseUrl,
   ssl: { rejectUnauthorized: false },
@@ -38,6 +43,7 @@ const defaults = {
   hourlyTarget: 31,
   minDelay: 75,
   maxDelay: 150,
+  maxAgeSeconds: 60,
   buttonText: "View Transaction",
   buttonUrl: "",
   paused: false
@@ -45,9 +51,11 @@ const defaults = {
 
 let settings = { ...defaults };
 let adminOffset = 0;
-let adminInput = null;
+let adminInput = new Map();
 let postingWorkerStarted = false;
 let lastApiRequest = 0;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(level, message, extra = {}) {
   console.log(JSON.stringify({
@@ -55,14 +63,15 @@ function log(level, message, extra = {}) {
   }));
 }
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-function nowMs() {
-  return Date.now();
-}
-
 function isTrue(value) {
   return value === true || value === 1 || value === "true";
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;",
+    '"': "&quot;", "'": "&#39;"
+  })[c]);
 }
 
 async function initDb() {
@@ -108,48 +117,30 @@ async function initDb() {
     [JSON.stringify(defaults)]
   );
 
-  const result = await pool.query(
+  const r = await pool.query(
     "SELECT settings FROM scanner_settings WHERE id = 1"
   );
-  settings = { ...defaults, ...result.rows[0].settings };
+  settings = { ...defaults, ...r.rows[0].settings };
 
-  const state = await pool.query(
-    "SELECT checkpoint_ms FROM scanner_state WHERE id = $1",
-    ["trc20-usdt"]
-  );
+  // Do not post anything left pending from before this deployment.
+  await pool.query(`
+    UPDATE scanner_transfers
+    SET posted_at = NOW(),
+        last_error = 'Skipped: latest-only deployment'
+    WHERE posted_at IS NULL
+  `);
 
-  if (state.rowCount === 0) {
-    const initial = nowMs() - config.initialLookbackMinutes * 60000;
-    await pool.query(
-      `INSERT INTO scanner_state (id, checkpoint_ms)
-       VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
-      ["trc20-usdt", String(initial)]
-    );
-  }
-
-  // Skip all already-pending transfers at deployment time.
-  // Newly discovered transfers remain eligible for posting.
+  // Start near the present instead of backfilling historical transfers.
   await pool.query(
-    `UPDATE scanner_transfers
-     SET posted_at = NOW(),
-         last_error = 'Skipped during latest-only deployment'
-     WHERE posted_at IS NULL`
+    `INSERT INTO scanner_state (id, checkpoint_ms)
+     VALUES ($1, $2)
+     ON CONFLICT (id) DO UPDATE
+       SET checkpoint_ms = EXCLUDED.checkpoint_ms,
+           updated_at = NOW()`,
+    ["trc20-usdt", String(Date.now() - 30000)]
   );
 
-  // Start from near the current chain time; do not backfill old history.
-  await pool.query(
-    `UPDATE scanner_state
-     SET checkpoint_ms = $2, updated_at = NOW()
-     WHERE id = $1`,
-    ["trc20-usdt", String(nowMs() - 30000)]
-  );
-
-  log("info", "Settings loaded", {
-    channel: settings.channel,
-    min: settings.min,
-    max: settings.max,
-    hourlyTarget: settings.hourlyTarget
-  });
+  log("info", "Database ready; old pending transfers skipped");
 }
 
 async function saveSettings() {
@@ -162,8 +153,6 @@ async function saveSettings() {
 }
 
 async function tg(method, body = {}) {
-  if (!config.botToken) throw new Error("TELEGRAM_BOT_TOKEN missing");
-
   const response = await fetch(
     `https://api.telegram.org/bot${config.botToken}/${method}`,
     {
@@ -197,80 +186,114 @@ function adminKeyboard() {
   return [
     [
       { text: "📢 Channel", callback_data: "channel" },
-      { text: "💵 Amount Filter", callback_data: "amount" }
+      { text: "💵 Amount", callback_data: "amount" }
     ],
     [
       { text: "🎯 Hourly Target", callback_data: "target" },
-      { text: "⏱ Posting Delay", callback_data: "delay" }
+      { text: "⏱ Delay", callback_data: "delay" }
     ],
     [
-      { text: "🔘 Post Button", callback_data: "button" },
+      { text: "🔘 Button Text", callback_data: "button" },
       { text: "🔗 Button URL", callback_data: "buttonurl" }
     ],
     [
       { text: settings.paused ? "▶️ Resume" : "⏸ Pause", callback_data: "pause" },
-      { text: "💾 Save Settings", callback_data: "save" }
+      { text: "📊 Hourly Report", callback_data: "report" }
     ],
-    [{ text: "🔄 Refresh Panel", callback_data: "admin" }]
+    [{ text: "💾 Save Settings", callback_data: "save" }]
   ];
 }
 
-function adminPanelText() {
+async function getHourlyReport() {
+  const r = await pool.query(`
+    WITH h AS (
+      SELECT date_trunc('hour', NOW()) AS start_time
+    )
+    SELECT
+      (SELECT start_time FROM h) AS hour_start,
+      (
+        SELECT COUNT(*)::int FROM scanner_transfers t, h
+        WHERE t.posted_at >= h.start_time
+          AND t.posted_at < h.start_time + INTERVAL '1 hour'
+      ) AS successful_posts,
+      (
+        SELECT COUNT(*)::int FROM scanner_transfers t, h
+        WHERE t.block_timestamp >= EXTRACT(EPOCH FROM h.start_time) * 1000
+          AND t.block_timestamp < EXTRACT(EPOCH FROM (h.start_time + INTERVAL '1 hour')) * 1000
+          AND t.amount_usdt BETWEEN $1 AND $2
+      ) AS eligible_transfers,
+      (
+        SELECT COALESCE(SUM(t.amount_usdt), 0)::numeric
+        FROM scanner_transfers t, h
+        WHERE t.block_timestamp >= EXTRACT(EPOCH FROM h.start_time) * 1000
+          AND t.block_timestamp < EXTRACT(EPOCH FROM (h.start_time + INTERVAL '1 hour')) * 1000
+          AND t.amount_usdt BETWEEN $1 AND $2
+      ) AS total_usdt
+  `, [settings.min, settings.max]);
+
+  return r.rows[0];
+}
+
+async function adminPanelText() {
+  const r = await getHourlyReport();
+
   return [
     "🛠 TRC20 SCANNER ADMIN",
     "",
     `Channel: ${settings.channel}`,
-    `Amount range: ${settings.min}–${settings.max} USDT`,
-    `Hourly target: ${settings.hourlyTarget}`,
-    `Delay: ${settings.minDelay}–${settings.maxDelay} seconds`,
-    `Post button: ${settings.buttonText || "(disabled)"}`,
+    `Amount: ${settings.min}–${settings.max} USDT`,
+    `Hourly target: ${settings.hourlyTarget} posts`,
+    `Delay: ${settings.minDelay}–${settings.maxDelay} sec`,
+    `Maximum payment age: ${settings.maxAgeSeconds} sec`,
+    `Button: ${settings.buttonText || "(disabled)"}`,
     `Button URL: ${settings.buttonUrl || "(not set)"}`,
     `Posting: ${settings.paused ? "PAUSED" : "ACTIVE"}`,
     "",
-    "Select a setting below to edit it."
+    "📊 CURRENT HOUR",
+    `Successful posts: ${r.successful_posts}`,
+    `Eligible transfers: ${r.eligible_transfers}`,
+    `Total eligible USDT: ${r.total_usdt}`,
+    `Hour: ${new Date(r.hour_start).toISOString()}`
   ].join("\n");
 }
 
 async function openAdmin(chatId) {
-  await adminMessage(chatId, adminPanelText(), adminKeyboard());
+  await adminMessage(chatId, await adminPanelText(), adminKeyboard());
 }
 
 async function handleAdminText(message) {
-  const fromId = Number(message?.from?.id);
-  if (fromId !== ADMIN_ID) return;
+  if (Number(message?.from?.id) !== ADMIN_ID) return;
+  if (message.chat?.type !== "private") return;
 
-  const chatId = message.chat?.id;
+  const chatId = message.chat.id;
   const text = String(message.text || "").trim();
-  if (!text) return;
 
   if (text === "/start" || text === "/admin") {
-    adminInput = null;
+    adminInput.delete(chatId);
     await openAdmin(chatId);
     return;
   }
 
-  if (!adminInput) return;
-
-  const field = adminInput;
-  adminInput = null;
+  const field = adminInput.get(chatId);
+  if (!field || !text) return;
+  adminInput.delete(chatId);
 
   if (field === "channel") {
-    const channel = text;
-    if (!/^(@[A-Za-z0-9_]{5,}|-100\d+)$/.test(channel)) {
-      await adminMessage(chatId, "Invalid channel. Use @channelusername or a numeric channel ID.");
+    if (!/^(@[A-Za-z0-9_]{5,}|-100\d+)$/.test(text)) {
+      await adminMessage(chatId, "Invalid channel. Use @channelusername or numeric channel ID.");
       return;
     }
-    settings.channel = channel;
+    settings.channel = text;
   } else if (field === "amount") {
-    const match = text.match(/^(\d+)\s+(\d+)$/);
-    if (!match) {
-      await adminMessage(chatId, "Send two numbers, for example: 30 350");
+    const m = text.match(/^(\d+)\s+(\d+)$/);
+    if (!m) {
+      await adminMessage(chatId, "Send min and max, e.g. 30 350");
       return;
     }
-    const min = Number(match[1]);
-    const max = Number(match[2]);
+    const min = Number(m[1]);
+    const max = Number(m[2]);
     if (min < 0 || max < min || max > 1000000000) {
-      await adminMessage(chatId, "Invalid amount range.");
+      await adminMessage(chatId, "Invalid range.");
       return;
     }
     settings.min = min;
@@ -278,34 +301,34 @@ async function handleAdminText(message) {
   } else if (field === "target") {
     const n = Number(text);
     if (!Number.isInteger(n) || n < 1 || n > 100) {
-      await adminMessage(chatId, "Target must be an integer from 1 to 100.");
+      await adminMessage(chatId, "Target must be 1–100.");
       return;
     }
     settings.hourlyTarget = n;
   } else if (field === "delay") {
-    const match = text.match(/^(\d+)\s+(\d+)$/);
-    if (!match) {
-      await adminMessage(chatId, "Send min and max seconds, for example: 75 150");
+    const m = text.match(/^(\d+)\s+(\d+)$/);
+    if (!m) {
+      await adminMessage(chatId, "Send min and max seconds, e.g. 75 150");
       return;
     }
-    const min = Number(match[1]);
-    const max = Number(match[2]);
+    const min = Number(m[1]);
+    const max = Number(m[2]);
     if (min < 5 || max < min || max > 3600) {
-      await adminMessage(chatId, "Delay must be between 5 and 3600 seconds.");
+      await adminMessage(chatId, "Delay must be 5–3600 seconds.");
       return;
     }
     settings.minDelay = min;
     settings.maxDelay = max;
   } else if (field === "button") {
     if (text.length > 50) {
-      await adminMessage(chatId, "Button text must be 50 characters or fewer.");
+      await adminMessage(chatId, "Button text maximum is 50 characters.");
       return;
     }
     settings.buttonText = text;
   } else if (field === "buttonurl") {
     try {
-      const url = new URL(text);
-      if (!["https:", "http:"].includes(url.protocol)) throw new Error();
+      const u = new URL(text);
+      if (!["https:", "http:"].includes(u.protocol)) throw new Error();
     } catch {
       await adminMessage(chatId, "Enter a valid http:// or https:// URL.");
       return;
@@ -317,40 +340,20 @@ async function handleAdminText(message) {
   await openAdmin(chatId);
 }
 
-async function handleCallback(query) {
-  if (Number(query?.from?.id) !== ADMIN_ID) {
+async function handleCallback(q) {
+  if (Number(q?.from?.id) !== ADMIN_ID || q.message?.chat?.type !== "private") {
     await tg("answerCallbackQuery", {
-      callback_query_id: query.id,
+      callback_query_id: q.id,
       text: "Not authorized",
       show_alert: true
     }).catch(() => {});
     return;
   }
 
-  await tg("answerCallbackQuery", { callback_query_id: query.id }).catch(() => {});
+  await tg("answerCallbackQuery", { callback_query_id: q.id }).catch(() => {});
 
-  const chatId = query.message?.chat?.id;
-  const action = query.data;
-
-  if (action === "admin") {
-    await openAdmin(chatId);
-    return;
-  }
-
-  const prompts = {
-    channel: ["channel", "Send channel username (e.g. @mychannel) or numeric channel ID."],
-    amount: ["amount", "Send minimum and maximum USDT separated by a space. Example: 30 350"],
-    target: ["target", "Send hourly posting target (1–100). Example: 31"],
-    delay: ["delay", "Send minimum and maximum delay in seconds. Example: 75 150"],
-    button: ["button", "Send the text for the post's inline button. Example: View Transaction"],
-    buttonurl: ["buttonurl", "Send the button URL beginning with https://"]
-  };
-
-  if (prompts[action]) {
-    adminInput = prompts[action][0];
-    await adminMessage(chatId, prompts[action][1]);
-    return;
-  }
+  const chatId = q.message.chat.id;
+  const action = q.data;
 
   if (action === "pause") {
     settings.paused = !settings.paused;
@@ -361,13 +364,41 @@ async function handleCallback(query) {
 
   if (action === "save") {
     await saveSettings();
-    await adminMessage(chatId, "✅ Settings saved to database.");
+    await adminMessage(chatId, "✅ Settings saved in PostgreSQL.");
     await openAdmin(chatId);
+    return;
+  }
+
+  if (action === "report") {
+    const r = await getHourlyReport();
+    await adminMessage(chatId, [
+      "📊 HOURLY REPORT",
+      "",
+      `Successful posts: ${r.successful_posts}`,
+      `Eligible transfers: ${r.eligible_transfers}`,
+      `Total eligible USDT: ${r.total_usdt}`,
+      `Hour: ${new Date(r.hour_start).toISOString()}`
+    ].join("\n"), adminKeyboard());
+    return;
+  }
+
+  const prompts = {
+    channel: ["channel", "Send channel username, e.g. @mychannel"],
+    amount: ["amount", "Send min and max USDT, e.g. 30 350"],
+    target: ["target", "Send hourly post target from 1 to 100"],
+    delay: ["delay", "Send min and max delay in seconds, e.g. 75 150"],
+    button: ["button", "Send the inline button text"],
+    buttonurl: ["buttonurl", "Send button URL beginning with https://"]
+  };
+
+  if (prompts[action]) {
+    adminInput.set(chatId, prompts[action][0]);
+    await adminMessage(chatId, prompts[action][1]);
   }
 }
 
 async function adminLoop() {
-  // This bot must not have a webhook or another active getUpdates poller.
+  // This bot token must not be used by another active getUpdates poller.
   while (true) {
     try {
       const updates = await tg("getUpdates", {
@@ -376,25 +407,21 @@ async function adminLoop() {
         allowed_updates: ["message", "callback_query"]
       });
 
-      for (const update of updates || []) {
-        adminOffset = update.update_id + 1;
-
-        if (update.callback_query) {
-          await handleCallback(update.callback_query).catch(error =>
-            log("warn", "Admin callback failed", { error: String(error.message || error) })
+      for (const u of updates || []) {
+        adminOffset = u.update_id + 1;
+        if (u.callback_query) {
+          await handleCallback(u.callback_query).catch(e =>
+            log("warn", "Admin callback error", { error: String(e.message || e) })
           );
-        } else if (update.message) {
-          await handleAdminText(update.message).catch(error =>
-            log("warn", "Admin message failed", { error: String(error.message || error) })
+        } else if (u.message) {
+          await handleAdminText(u.message).catch(e =>
+            log("warn", "Admin message error", { error: String(e.message || e) })
           );
         }
       }
-    } catch (error) {
-      const wait = Number(error?.retryAfter || 0);
-      log("warn", "Admin polling retry", {
-        error: String(error.message || error).slice(0, 300)
-      });
-      await sleep(wait ? wait * 1000 + 1000 : 5000);
+    } catch (e) {
+      log("warn", "Admin polling retry", { error: String(e.message || e).slice(0, 300) });
+      await sleep(e.retryAfter ? e.retryAfter * 1000 + 1000 : 5000);
     }
   }
 }
@@ -404,7 +431,6 @@ function getAmountWhole(tx) {
   const decimals = Number(
     token.tokenDecimal ?? token.token_decimal ?? tx.tokenDecimal ?? USDT_DECIMALS
   );
-
   if (decimals !== USDT_DECIMALS) return null;
 
   const rawValue = tx?.quant ?? tx?.amount_str ?? tx?.amount;
@@ -418,13 +444,11 @@ function getAmountWhole(tx) {
   }
 
   if (raw < 0n) return null;
-
   const scale = 10n ** BigInt(decimals);
   if (raw % scale !== 0n) return null;
 
   const whole = raw / scale;
   if (whole < BigInt(settings.min) || whole > BigInt(settings.max)) return null;
-
   return whole;
 }
 
@@ -457,6 +481,10 @@ function eligibleTransfer(tx) {
     config.excludedAddresses.has(f.from.toLowerCase()) ||
     config.excludedAddresses.has(f.to.toLowerCase())
   ) return null;
+
+  // Ignore old, future-dated or malformed timestamps.
+  const age = Date.now() - f.timestamp;
+  if (!f.timestamp || age < 0 || age > settings.maxAgeSeconds * 1000) return null;
 
   return { ...f, amount };
 }
@@ -492,7 +520,9 @@ async function requestJson(url, headers = {}, attempts = 5) {
       });
 
       if (error.status && [400, 401, 403, 404].includes(error.status)) break;
-      if (attempt < attempts) await sleep(Math.min(1500 * 2 ** (attempt - 1), 15000));
+      if (attempt < attempts) {
+        await sleep(Math.min(1500 * 2 ** (attempt - 1), 15000));
+      }
     }
   }
 
@@ -514,12 +544,12 @@ async function fetchWindowPage(startMs, endMs, offset) {
 }
 
 async function getCheckpoint() {
-  const result = await pool.query(
+  const r = await pool.query(
     "SELECT checkpoint_ms FROM scanner_state WHERE id = $1",
     ["trc20-usdt"]
   );
-  if (!result.rowCount) throw new Error("Scanner checkpoint missing");
-  return Number(result.rows[0].checkpoint_ms);
+  if (!r.rowCount) throw new Error("Scanner checkpoint missing");
+  return Number(r.rows[0].checkpoint_ms);
 }
 
 async function saveCheckpoint(value) {
@@ -548,12 +578,12 @@ async function scanWindow(startMs, endMs) {
 
       await pool.query(
         `INSERT INTO scanner_transfers
-         (txid, amount_usdt, from_address, to_address, block_timestamp)
+          (txid, amount_usdt, from_address, to_address, block_timestamp)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (txid) DO NOTHING`,
         [
           candidate.txid, String(candidate.amount), candidate.from,
-          candidate.to, candidate.timestamp || null
+          candidate.to, candidate.timestamp
         ]
       );
     }
@@ -578,27 +608,15 @@ async function scanWindow(startMs, endMs) {
   return false;
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, char => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;",
-    '"': "&quot;", "'": "&#39;"
-  })[char]);
-}
-
 function postText(row) {
-  const txid = escapeHtml(row.txid);
-  const from = escapeHtml(row.from_address);
-  const to = escapeHtml(row.to_address);
-  const amount = escapeHtml(String(row.amount_usdt));
-
   return [
     "🟢 <b>New USDT Transfer</b>",
     "",
-    `💵 Amount: <b>${amount} USDT</b>`,
+    `💵 Amount: <b>${escapeHtml(String(row.amount_usdt))} USDT</b>`,
     "🌐 Network: TRON (TRC20)",
-    `📤 From: <code>${from}</code>`,
-    `📥 To: <code>${to}</code>`,
-    `🔗 <a href="https://tronscan.org/#/transaction/${txid}">View transaction</a>`
+    `📤 From: <code>${escapeHtml(row.from_address)}</code>`,
+    `📥 To: <code>${escapeHtml(row.to_address)}</code>`,
+    `🔗 <a href="https://tronscan.org/#/transaction/${escapeHtml(row.txid)}">View transaction</a>`
   ].join("\n");
 }
 
@@ -632,10 +650,10 @@ async function postingWorker() {
         continue;
       }
 
-      const hr = await pool.query(
+      const hour = await pool.query(
         "SELECT date_trunc('hour', NOW()) AS hour_start"
       );
-      const hourStart = hr.rows[0].hour_start;
+      const hourStart = hour.rows[0].hour_start;
 
       await pool.query(
         `INSERT INTO scanner_hourly_limits (hour_start, target_count)
@@ -644,7 +662,8 @@ async function postingWorker() {
       );
 
       const count = await pool.query(
-        `SELECT COUNT(*)::int AS sent FROM scanner_transfers
+        `SELECT COUNT(*)::int AS sent
+         FROM scanner_transfers
          WHERE posted_at >= $1
            AND posted_at < $1::timestamptz + INTERVAL '1 hour'`,
         [hourStart]
@@ -656,26 +675,64 @@ async function postingWorker() {
         continue;
       }
 
-      // The database queue is only for transfers found after deployment.
-      // Newest block timestamp is posted first.
+      // Do not send any payment that has aged beyond the configured limit.
+      await pool.query(
+        `UPDATE scanner_transfers
+         SET posted_at = NOW(),
+             last_error = 'Skipped: payment older than latest-only limit'
+         WHERE posted_at IS NULL
+           AND (
+             block_timestamp IS NULL
+             OR block_timestamp < $1
+             OR block_timestamp > $2
+           )`,
+        [
+          Date.now() - settings.maxAgeSeconds * 1000,
+          Date.now()
+        ]
+      );
+
       const pending = await pool.query(
         `SELECT txid, amount_usdt, from_address, to_address, block_timestamp
          FROM scanner_transfers
          WHERE posted_at IS NULL
-         ORDER BY block_timestamp DESC NULLS LAST, created_at DESC
-         LIMIT 1`
+           AND block_timestamp >= $1
+           AND block_timestamp <= $2
+           AND amount_usdt BETWEEN $3 AND $4
+         ORDER BY block_timestamp DESC, created_at DESC
+         LIMIT 1`,
+        [
+          Date.now() - settings.maxAgeSeconds * 1000,
+          Date.now(),
+          settings.min,
+          settings.max
+        ]
       );
 
       if (!pending.rows.length) {
-        await sleep(3000);
+        await sleep(2000);
         continue;
       }
 
       const row = pending.rows[0];
+
+      // Re-check age immediately before sending.
+      if (Date.now() - Number(row.block_timestamp) > settings.maxAgeSeconds * 1000) {
+        await pool.query(
+          `UPDATE scanner_transfers
+           SET posted_at = NOW(),
+               last_error = 'Skipped: expired before send'
+           WHERE txid = $1 AND posted_at IS NULL`,
+          [row.txid]
+        );
+        continue;
+      }
+
       await sendTransfer(row);
 
       await pool.query(
-        `UPDATE scanner_transfers SET posted_at = NOW(), last_error = NULL
+        `UPDATE scanner_transfers
+         SET posted_at = NOW(), last_error = NULL
          WHERE txid = $1 AND posted_at IS NULL`,
         [row.txid]
       );
@@ -691,12 +748,12 @@ async function postingWorker() {
         Math.floor(Math.random() * (settings.maxDelay - settings.minDelay + 1));
       await sleep(delay * 1000);
     } catch (error) {
-      const retryAfter = Number(error?.retryAfter || 0);
+      const retry = Number(error?.retryAfter || 0);
       log("warn", "Posting worker retry", {
         error: String(error.message || error).slice(0, 400),
-        retryAfter
+        retryAfter: retry
       });
-      await sleep(retryAfter ? retryAfter * 1000 + 1000 : 10000);
+      await sleep(retry ? retry * 1000 + 1000 : 10000);
     }
   }
 }
@@ -708,10 +765,14 @@ async function runCycle() {
   }
 
   let checkpoint = await getCheckpoint();
-  const safeEnd = nowMs() - 30000;
+  const safeEnd = Date.now() - 30000;
 
   while (checkpoint < safeEnd) {
-    const end = Math.min(safeEnd, checkpoint + config.windowSeconds * 1000);
+    const end = Math.min(
+      safeEnd,
+      checkpoint + config.windowSeconds * 1000
+    );
+
     const complete = await scanWindow(checkpoint, end);
     if (!complete) return;
 
@@ -721,18 +782,16 @@ async function runCycle() {
 }
 
 async function main() {
-  if (!config.databaseUrl) throw new Error("DATABASE_URL missing");
-  if (!config.botToken) throw new Error("TELEGRAM_BOT_TOKEN missing");
-
   await pool.query("SELECT 1");
   await initDb();
 
-  log("info", "Scanner and admin starting", {
-    min: settings.min, max: settings.max,
-    hourlyTarget: settings.hourlyTarget
+  log("info", "Scanner starting", {
+    min: settings.min,
+    max: settings.max,
+    hourlyTarget: settings.hourlyTarget,
+    maxAgeSeconds: settings.maxAgeSeconds
   });
 
-  // Admin polling is separate from scanning/posting.
   void adminLoop();
 
   while (true) {
@@ -743,6 +802,7 @@ async function main() {
         error: String(error.stack || error).slice(0, 1000)
       });
     }
+
     await sleep(config.pollSeconds * 1000);
   }
 }
