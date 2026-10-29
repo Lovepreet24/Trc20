@@ -1,3 +1,4 @@
+
 import pg from "pg";
 
 const { Pool } = pg;
@@ -11,42 +12,223 @@ const config = {
   botToken: process.env.TELEGRAM_BOT_TOKEN,
   chatId: process.env.TELEGRAM_CHAT_ID,
   databaseUrl: process.env.DATABASE_URL,
+
   min: BigInt(process.env.MIN_USDT || "30"),
   max: BigInt(process.env.MAX_USDT || "350"),
-  pollSeconds: Math.max(10, Number(process.env.POLL_SECONDS || 15)),
-  initialLookbackMinutes: Math.max(1, Number(process.env.INITIAL_LOOKBACK_MINUTES || 10)),
+
+  pollSeconds: Math.max(15, Number(process.env.POLL_SECONDS || 20)),
+  initialLookbackMinutes: Math.max(
+    1,
+    Number(process.env.INITIAL_LOOKBACK_MINUTES || 10)
+  ),
   windowSeconds: Math.max(10, Number(process.env.WINDOW_SECONDS || 60)),
   pageSize: Math.min(50, Math.max(1, Number(process.env.PAGE_SIZE || 50))),
-  maxPages: Math.max(1, Number(process.env.MAX_PAGES_PER_WINDOW || 200)),
-  title: process.env.TITLE || "New USDT Transfer",
+  maxPages: Math.max(
+    1,
+    Number(process.env.MAX_PAGES_PER_WINDOW || 200)
+  ),
+
   excludedAddresses: new Set(
     (process.env.EXCLUDED_ADDRESSES || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
   )
 };
 
-if (!config.apiKey || !config.botToken || !config.chatId || !config.databaseUrl) {
-  console.error("Missing required environment variables. See .env.example");
-  process.exit(1);
-}
-if (config.min < 0n || config.max < config.min) {
-  console.error("Invalid MIN_USDT/MAX_USDT");
-  process.exit(1);
-}
-
 const pool = new Pool({
   connectionString: config.databaseUrl,
-  ssl: process.env.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false },
-  max: 3,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 30000,
+  max: 5
 });
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const nowMs = () => Date.now();
-const iso = ms => new Date(ms).toISOString();
 function log(level, message, extra = {}) {
-  console.log(JSON.stringify({ time: new Date().toISOString(), level, message, ...extra }));
+  console.log(JSON.stringify({
+    time: new Date().toISOString(),
+    level,
+    message,
+    ...extra
+  }));
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function isTrue(value) {
+  return value === true || value === 1 || value === "true";
+}
+
+function getAmountWhole(tx) {
+  const token = tx?.tokenInfo || {};
+
+  const decimals = Number(
+    token.tokenDecimal ??
+    token.token_decimal ??
+    tx.tokenDecimal ??
+    USDT_DECIMALS
+  );
+
+  if (decimals !== USDT_DECIMALS) return null;
+
+  const rawValue = tx?.quant ?? tx?.amount_str ?? tx?.amount;
+  if (rawValue === undefined || rawValue === null) return null;
+
+  let raw;
+
+  try {
+    raw = BigInt(String(rawValue));
+  } catch {
+    return null;
+  }
+
+  if (raw < 0n) return null;
+
+  const scale = 10n ** BigInt(decimals);
+
+  // Only exact whole-number USDT transfers.
+  if (raw % scale !== 0n) return null;
+
+  const whole = raw / scale;
+
+  if (whole < config.min || whole > config.max) return null;
+
+  return whole;
+}
+
+function transferFields(tx) {
+  return {
+    txid: tx?.transaction_id || tx?.transactionId || tx?.hash || "",
+    from: tx?.from_address || tx?.fromAddress || "",
+    to: tx?.to_address || tx?.toAddress || "",
+    timestamp: Number(
+      tx?.block_ts ??
+      tx?.block_timestamp ??
+      tx?.timestamp ??
+      0
+    ),
+    confirmed: isTrue(tx?.confirmed),
+    contractRet: String(tx?.contractRet || "").toUpperCase(),
+    finalResult: String(tx?.finalResult || "").toUpperCase(),
+    reverted: isTrue(tx?.revert),
+    contract:
+      tx?.contract_address ||
+      tx?.contractAddress ||
+      tx?.tokenInfo?.tokenId ||
+      "",
+    eventType: String(tx?.event_type || tx?.eventType || "Transfer")
+  };
+}
+
+function eligibleTransfer(tx) {
+  const f = transferFields(tx);
+  const amount = getAmountWhole(tx);
+
+  if (!f.txid || !f.from || !f.to || amount === null) return null;
+
+  if (f.contract && f.contract !== USDT_CONTRACT) return null;
+
+  if (f.eventType.toLowerCase() !== "transfer") return null;
+
+  // Never post unconfirmed or failed transactions.
+  if (!f.confirmed || f.reverted) return null;
+  if (f.contractRet !== "SUCCESS") return null;
+  if (f.finalResult !== "SUCCESS") return null;
+
+  if (
+    config.excludedAddresses.has(f.from.toLowerCase()) ||
+    config.excludedAddresses.has(f.to.toLowerCase())
+  ) {
+    return null;
+  }
+
+  return { ...f, amount };
+}
+
+async function requestJson(url, headers = {}, attempts = 5) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(20000)
+      });
+
+      const body = await response.text();
+
+      if (!response.ok) {
+        const detail = body.slice(0, 500);
+
+        const error = new Error(
+          `HTTP ${response.status}: ${detail}`
+        );
+
+        error.status = response.status;
+
+        // Don't retry permanent authentication or bad-request errors.
+        if ([400, 401, 403, 404].includes(response.status)) {
+          throw error;
+        }
+
+        throw error;
+      }
+
+      try {
+        return JSON.parse(body);
+      } catch {
+        throw new Error(`Invalid JSON response: ${body.slice(0, 300)}`);
+      }
+    } catch (error) {
+      lastError = error;
+
+      log("warn", "Request attempt failed", {
+        attempt,
+        maxAttempts: attempts,
+        status: error.status || null,
+        error: String(error.message || error).slice(0, 500)
+      });
+
+      if (
+        error.status &&
+        [400, 401, 403, 404].includes(error.status)
+      ) {
+        break;
+      }
+
+      if (attempt < attempts) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(1000 * 2 ** (attempt - 1), 10000))
+        );
+      }
+    }
+  }
+
+  throw lastError || new Error("Request failed");
+}
+
+async function fetchWindowPage(startMs, endMs, offset) {
+  const url = new URL("/api/token_trc20/transfers", API_BASE);
+
+  url.searchParams.set("contract_address", USDT_CONTRACT);
+
+  // Request confirmed transfers.
+  url.searchParams.set("confirm", "1");
+
+  url.searchParams.set("start_timestamp", String(startMs));
+  url.searchParams.set("end_timestamp", String(endMs));
+  url.searchParams.set("start", String(offset));
+  url.searchParams.set("limit", String(config.pageSize));
+
+  const headers = {};
+
+  if (config.apiKey) {
+    headers["TRON-PRO-API-KEY"] = config.apiKey;
+  }
+
+  return requestJson(url, headers);
 }
 
 async function initDb() {
@@ -56,6 +238,7 @@ async function initDb() {
       checkpoint_ms BIGINT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
     CREATE TABLE IF NOT EXISTS scanner_transfers (
       txid TEXT PRIMARY KEY,
       amount_usdt BIGINT NOT NULL,
@@ -67,95 +250,50 @@ async function initDb() {
       last_error TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
     CREATE INDEX IF NOT EXISTS scanner_transfers_pending_idx
-      ON scanner_transfers (created_at) WHERE posted_at IS NULL;
+      ON scanner_transfers (created_at)
+      WHERE posted_at IS NULL;
   `);
 
-  const result = await pool.query("SELECT checkpoint_ms FROM scanner_state WHERE id = $1", ["trc20-usdt"]);
+  const result = await pool.query(
+    "SELECT checkpoint_ms FROM scanner_state WHERE id = $1",
+    ["trc20-usdt"]
+  );
+
   if (result.rowCount === 0) {
-    const initial = nowMs() - config.initialLookbackMinutes * 60_000;
+    const initial =
+      nowMs() - config.initialLookbackMinutes * 60_000;
+
     await pool.query(
-      "INSERT INTO scanner_state (id, checkpoint_ms) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+      `INSERT INTO scanner_state (id, checkpoint_ms)
+       VALUES ($1, $2)
+       ON CONFLICT (id) DO NOTHING`,
       ["trc20-usdt", String(initial)]
     );
-    log("info", "Initialized scan checkpoint", { checkpoint: iso(initial) });
   }
 }
 
-function getAmountWhole(tx) {
-  const token = tx?.tokenInfo || {};
-  const decimals = Number(token.tokenDecimal ?? token.token_decimal ?? tx.tokenDecimal ?? USDT_DECIMALS);
-  if (decimals !== USDT_DECIMALS) return null;
+async function getCheckpoint() {
+  const result = await pool.query(
+    "SELECT checkpoint_ms FROM scanner_state WHERE id = $1",
+    ["trc20-usdt"]
+  );
 
-  const rawValue = tx?.quant ?? tx?.amount_str ?? tx?.amount;
-  if (rawValue === undefined || rawValue === null) return null;
-
-  let raw;
-  try { raw = BigInt(String(rawValue)); } catch { return null; }
-  if (raw < 0n) return null;
-  const scale = 10n ** BigInt(decimals);
-  if (raw % scale !== 0n) return null;
-
-  const whole = raw / scale;
-  if (whole < config.min || whole > config.max) return null;
-  return whole;
-}
-
-function transferFields(tx) {
-  return {
-    txid: tx?.transaction_id || tx?.transactionId || tx?.hash || "",
-    from: tx?.from_address || tx?.fromAddress || "",
-    to: tx?.to_address || tx?.toAddress || "",
-    timestamp: Number(tx?.block_ts ?? tx?.block_timestamp ?? tx?.timestamp ?? 0),
-    // The request itself uses TronScan confirm=0 (confirmed-only); do not depend on an optional response boolean.\n    confirmed: tx?.revert !== true,
-    successful: (tx?.contractRet ?? tx?.contract_ret ?? tx?.result ?? "SUCCESS") === "SUCCESS",
-    contract: tx?.contract_address || tx?.contractAddress || tx?.tokenInfo?.tokenId || "",
-    eventType: tx?.event_type || tx?.eventType || "Transfer"
-  };
-}
-
-function eligibleTransfer(tx) {
-  const f = transferFields(tx);
-  const amount = getAmountWhole(tx);
-  if (!f.txid || !f.from || !f.to || amount === null) return null;
-  if (f.contract && f.contract !== USDT_CONTRACT) return null;
-  if (f.eventType.toLowerCase() !== "transfer") return null;
-  if (!f.confirmed || !f.successful) return null;
-  if (config.excludedAddresses.has(f.from) || config.excludedAddresses.has(f.to)) return null;
-  return { ...f, amount };
-}
-
-async function fetchWindowPage(startMs, endMs, offset) {
-  const url = new URL("/api/token_trc20/transfers", API_BASE);
-  url.searchParams.set("contract_address", USDT_CONTRACT);
-  url.searchParams.set("confirm", "0");
-  url.searchParams.set("start_timestamp", String(startMs));
-  url.searchParams.set("end_timestamp", String(endMs));
-  url.searchParams.set("start", String(offset));
-  url.searchParams.set("limit", String(config.pageSize));
-
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const response = await fetch(url, {
-        headers: { "TRON-PRO-API-KEY": config.apiKey },
-        signal: AbortSignal.timeout(20000)
-      });
-      if (response.status === 429 || response.status >= 500) {
-        const retryAfter = Number(response.headers.get("retry-after") || 0);
-        await sleep(retryAfter > 0 ? retryAfter * 1000 : Math.min(30000, 1000 * (2 ** attempt)));
-        continue;
-      }
-      if (!response.ok) {
-        const body = (await response.text()).slice(0, 300);
-        throw new Error(`TronScan HTTP ${response.status}: ${body}`);
-      }
-      return await response.json();
-    } catch (error) {
-      if (attempt === 4) throw error;
-      await sleep(Math.min(30000, 1000 * (2 ** attempt)));
-    }
+  if (result.rowCount === 0) {
+    throw new Error("Scanner checkpoint is missing");
   }
-  throw new Error("TronScan request failed after retries");
+
+  return Number(result.rows[0].checkpoint_ms);
+}
+
+async function saveCheckpoint(checkpoint) {
+  await pool.query(
+    `UPDATE scanner_state
+     SET checkpoint_ms = $2, updated_at = NOW()
+     WHERE id = $1`,
+    ["trc20-usdt", String(checkpoint)]
+  );
 }
 
 async function scanWindow(startMs, endMs) {
@@ -166,55 +304,105 @@ async function scanWindow(startMs, endMs) {
 
   while (pages < config.maxPages) {
     const data = await fetchWindowPage(startMs, endMs, offset);
+
     const rows = Array.isArray(data.token_transfers)
       ? data.token_transfers
-      : Array.isArray(data.data) ? data.data : [];
-    fetched += rows.length;
+      : Array.isArray(data.data)
+        ? data.data
+        : [];
+
     pages++;
+    fetched += rows.length;
 
     for (const tx of rows) {
       const candidate = eligibleTransfer(tx);
+
       if (!candidate) continue;
+
       const inserted = await pool.query(
-        `INSERT INTO scanner_transfers (txid, amount_usdt, from_address, to_address, block_timestamp)
+        `INSERT INTO scanner_transfers
+          (txid, amount_usdt, from_address, to_address, block_timestamp)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (txid) DO NOTHING`,
-        [candidate.txid, candidate.amount.toString(), candidate.from, candidate.to,
-         candidate.timestamp || null]
+        [
+          candidate.txid,
+          String(candidate.amount),
+          candidate.from,
+          candidate.to,
+          candidate.timestamp || null
+        ]
       );
+
       candidates += inserted.rowCount;
     }
 
     if (rows.length < config.pageSize) {
-      return { pages, fetched, candidates, complete: true };
+      log("info", "Scanned time window", {
+        start: new Date(startMs).toISOString(),
+        end: new Date(endMs).toISOString(),
+        pages,
+        fetched,
+        candidates,
+        complete: true
+      });
+
+      return { complete: true };
     }
+
     offset += rows.length;
+
+    // Avoid silently skipping a window that has too many results.
     if (offset >= 10000) break;
   }
 
-  // Do not advance checkpoint if the window was not fully paginated.
-  return { pages, fetched, candidates, complete: false };
+  log("error", "Scan window incomplete; checkpoint not advanced", {
+    start: new Date(startMs).toISOString(),
+    end: new Date(endMs).toISOString(),
+    pages,
+    fetched,
+    candidates,
+    complete: false
+  });
+
+  return { complete: false };
 }
 
 function escapeHtml(value) {
-  return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
 }
 
 function postText(row) {
-  const txid = row.txid;
+  const txid = escapeHtml(row.txid);
+  const from = escapeHtml(row.from_address);
+  const to = escapeHtml(row.to_address);
+  const amount = escapeHtml(String(row.amount_usdt));
+
   return [
-    `🟢 <b>${escapeHtml(config.title)}</b>`,
+    "🟢 <b>New USDT Transfer</b>",
     "",
-    `<b>Amount:</b> ${row.amount_usdt} USDT`,
-    "<b>Network:</b> TRON (TRC20)",
-    `<b>TXID:</b> <code>${escapeHtml(txid)}</code>`,
-    "",
-    `<a href="https://tronscan.org/#/transaction/${encodeURIComponent(txid)}">View Transaction on TronScan</a>`
+    `💵 Amount: <b>${amount} USDT</b>`,
+    "🌐 Network: TRON (TRC20)",
+    `📤 From: <code>${from}</code>`,
+    `📥 To: <code>${to}</code>`,
+    `🔗 <a href="https://tronscan.org/#/transaction/${txid}">View transaction</a>`
   ].join("\n");
 }
 
 async function sendTelegram(text) {
-  const response = await fetch(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
+  if (!config.botToken || !config.chatId) {
+    throw new Error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing");
+  }
+
+  const url =
+    `https://api.telegram.org/bot${config.botToken}/sendMessage`;
+
+  const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -225,107 +413,138 @@ async function sendTelegram(text) {
     }),
     signal: AbortSignal.timeout(20000)
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.ok) {
-    const retryAfter = data?.parameters?.retry_after;
-    const error = new Error(`Telegram API error ${response.status}: ${data?.description || "unknown error"}`);
-    error.retryAfter = retryAfter;
-    throw error;
+
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok || body.ok !== true) {
+    throw new Error(
+      `Telegram send failed: HTTP ${response.status} ` +
+      JSON.stringify(body).slice(0, 500)
+    );
   }
 }
 
 async function flushPending() {
-  const pending = await pool.query(
-    `SELECT txid, amount_usdt, from_address, to_address, block_timestamp, attempts
-     FROM scanner_transfers WHERE posted_at IS NULL
-     ORDER BY block_timestamp NULLS FIRST, created_at ASC LIMIT 25`
+  const result = await pool.query(
+    `SELECT txid, amount_usdt, from_address, to_address
+     FROM scanner_transfers
+     WHERE posted_at IS NULL
+     ORDER BY created_at ASC
+     LIMIT 20`
   );
 
-  for (const row of pending.rows) {
+  for (const row of result.rows) {
     try {
       await sendTelegram(postText(row));
+
       await pool.query(
-        "UPDATE scanner_transfers SET posted_at = NOW(), last_error = NULL WHERE txid = $1",
+        `UPDATE scanner_transfers
+         SET posted_at = NOW(), last_error = NULL
+         WHERE txid = $1 AND posted_at IS NULL`,
         [row.txid]
       );
-      log("info", "Posted transfer", { txid: row.txid, amount: row.amount_usdt });
+
+      log("info", "Telegram post sent", {
+        txid: row.txid,
+        amount: row.amount_usdt
+      });
     } catch (error) {
       await pool.query(
-        "UPDATE scanner_transfers SET attempts = attempts + 1, last_error = $2 WHERE txid = $1",
-        [row.txid, String(error?.message || error).slice(0, 500)]
+        `UPDATE scanner_transfers
+         SET attempts = attempts + 1, last_error = $2
+         WHERE txid = $1`,
+        [row.txid, String(error.message || error).slice(0, 1000)]
       );
-      log("error", "Could not post transfer; will retry", { txid: row.txid, error: error.message });
-      if (error.retryAfter) await sleep(error.retryAfter * 1000);
-      else await sleep(1500);
+
+      log("error", "Telegram post failed", {
+        txid: row.txid,
+        error: String(error.message || error).slice(0, 500)
+      });
+
+      // Avoid hammering Telegram if it is unavailable.
       break;
     }
   }
 }
 
 async function runCycle() {
-  // Deliver queued messages first, so a Telegram outage doesn't block scanning.
   await flushPending();
 
-  const state = await pool.query("SELECT checkpoint_ms FROM scanner_state WHERE id = $1", ["trc20-usdt"]);
-  let checkpoint = Number(state.rows[0].checkpoint_ms);
-  const now = nowMs();
-  const endSafe = now - 15_000; // small safety lag for indexer/confirmation delay
-  if (checkpoint >= endSafe) return;
+  let checkpoint = await getCheckpoint();
+  const safeEnd = nowMs() - 30_000;
 
-  while (checkpoint < endSafe) {
-    const end = Math.min(endSafe, checkpoint + config.windowSeconds * 1000);
+  while (checkpoint < safeEnd) {
+    const end = Math.min(
+      safeEnd,
+      checkpoint + config.windowSeconds * 1000
+    );
+
     const result = await scanWindow(checkpoint, end);
 
     if (!result.complete) {
-      log("error", "Window pagination limit reached; checkpoint not advanced to avoid silent skips", {
-        start: iso(checkpoint), end: iso(end), pages: result.pages, fetched: result.fetched
-      });
+      // Retry this window next cycle instead of skipping it.
       return;
     }
 
-    await pool.query(
-      "UPDATE scanner_state SET checkpoint_ms = $2, updated_at = NOW() WHERE id = $1",
-      ["trc20-usdt", String(end)]
-    );
+    await saveCheckpoint(end);
     checkpoint = end;
-    log("info", "Scanned time window", {
-      start: iso(result.startMs ?? (end - config.windowSeconds * 1000)),
-      end: iso(end),
-      pages: result.pages,
-      fetched: result.fetched,
-      candidates: result.candidates
-    });
   }
 
   await flushPending();
 }
 
-let stopping = false;
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-  log("info", `Received ${signal}; shutting down`);
-  try { await pool.end(); } catch {}
-  process.exit(0);
+async function main() {
+  if (!config.databaseUrl) {
+    throw new Error("DATABASE_URL is missing");
+  }
+
+  if (config.min < 0n || config.max < config.min) {
+    throw new Error("Invalid MIN_USDT / MAX_USDT configuration");
+  }
+
+  await pool.query("SELECT 1");
+  await initDb();
+
+  log("info", "Scanner started", {
+    min: String(config.min),
+    max: String(config.max),
+    pollSeconds: config.pollSeconds,
+    windowSeconds: config.windowSeconds,
+    database: "connected"
+  });
+
+  while (true) {
+    try {
+      await runCycle();
+    } catch (error) {
+      log("error", "Cycle failed", {
+        error: String(error.stack || error).slice(0, 1500)
+      });
+    }
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, config.pollSeconds * 1000)
+    );
+  }
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-await initDb();
-log("info", "Scanner started", {
-  min: config.min.toString(),
-  max: config.max.toString(),
-  pollSeconds: config.pollSeconds,
-  windowSeconds: config.windowSeconds,
-  database: "connected"
+process.on("SIGTERM", async () => {
+  log("info", "Received SIGTERM; shutting down");
+  await pool.end().catch(() => {});
+  process.exit(0);
 });
 
-while (!stopping) {
-  try {
-    await runCycle();
-  } catch (error) {
-    log("error", "Cycle failed", { error: String(error?.stack || error).slice(0, 1200) });
-  }
-  await sleep(config.pollSeconds * 1000);
-}
+process.on("SIGINT", async () => {
+  log("info", "Received SIGINT; shutting down");
+  await pool.end().catch(() => {});
+  process.exit(0);
+});
+
+main().catch(async (error) => {
+  log("error", "Fatal startup error", {
+    error: String(error.stack || error).slice(0, 1500)
+  });
+
+  await pool.end().catch(() => {});
+  process.exit(1);
+});
