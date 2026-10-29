@@ -1,4 +1,3 @@
-
 import pg from "pg";
 
 const { Pool } = pg;
@@ -12,26 +11,17 @@ const config = {
   botToken: process.env.TELEGRAM_BOT_TOKEN,
   chatId: process.env.TELEGRAM_CHAT_ID,
   databaseUrl: process.env.DATABASE_URL,
-
   min: BigInt(process.env.MIN_USDT || "30"),
   max: BigInt(process.env.MAX_USDT || "350"),
-
   pollSeconds: Math.max(15, Number(process.env.POLL_SECONDS || 20)),
-  initialLookbackMinutes: Math.max(
-    1,
-    Number(process.env.INITIAL_LOOKBACK_MINUTES || 10)
-  ),
+  initialLookbackMinutes: Math.max(1, Number(process.env.INITIAL_LOOKBACK_MINUTES || 10)),
   windowSeconds: Math.max(10, Number(process.env.WINDOW_SECONDS || 60)),
   pageSize: Math.min(50, Math.max(1, Number(process.env.PAGE_SIZE || 50))),
-  maxPages: Math.max(
-    1,
-    Number(process.env.MAX_PAGES_PER_WINDOW || 200)
-  ),
-
+  maxPages: Math.max(1, Number(process.env.MAX_PAGES_PER_WINDOW || 200)),
   excludedAddresses: new Set(
     (process.env.EXCLUDED_ADDRESSES || "")
       .split(",")
-      .map((s) => s.trim().toLowerCase())
+      .map(s => s.trim().toLowerCase())
       .filter(Boolean)
   )
 };
@@ -63,7 +53,6 @@ function isTrue(value) {
 
 function getAmountWhole(tx) {
   const token = tx?.tokenInfo || {};
-
   const decimals = Number(
     token.tokenDecimal ??
     token.token_decimal ??
@@ -77,7 +66,6 @@ function getAmountWhole(tx) {
   if (rawValue === undefined || rawValue === null) return null;
 
   let raw;
-
   try {
     raw = BigInt(String(rawValue));
   } catch {
@@ -87,12 +75,9 @@ function getAmountWhole(tx) {
   if (raw < 0n) return null;
 
   const scale = 10n ** BigInt(decimals);
-
-  // Only exact whole-number USDT transfers.
   if (raw % scale !== 0n) return null;
 
   const whole = raw / scale;
-
   if (whole < config.min || whole > config.max) return null;
 
   return whole;
@@ -104,10 +89,7 @@ function transferFields(tx) {
     from: tx?.from_address || tx?.fromAddress || "",
     to: tx?.to_address || tx?.toAddress || "",
     timestamp: Number(
-      tx?.block_ts ??
-      tx?.block_timestamp ??
-      tx?.timestamp ??
-      0
+      tx?.block_ts ?? tx?.block_timestamp ?? tx?.timestamp ?? 0
     ),
     confirmed: isTrue(tx?.confirmed),
     contractRet: String(tx?.contractRet || "").toUpperCase(),
@@ -127,12 +109,8 @@ function eligibleTransfer(tx) {
   const amount = getAmountWhole(tx);
 
   if (!f.txid || !f.from || !f.to || amount === null) return null;
-
   if (f.contract && f.contract !== USDT_CONTRACT) return null;
-
   if (f.eventType.toLowerCase() !== "transfer") return null;
-
-  // Never post unconfirmed or failed transactions.
   if (!f.confirmed || f.reverted) return null;
   if (f.contractRet !== "SUCCESS") return null;
   if (f.finalResult !== "SUCCESS") return null;
@@ -152,6 +130,9 @@ async function requestJson(url, headers = {}, attempts = 5) {
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
+      // Pace requests to reduce TronScan API rate limits.
+      await new Promise(resolve => setTimeout(resolve, 1100));
+
       const response = await fetch(url, {
         headers,
         signal: AbortSignal.timeout(20000)
@@ -160,15 +141,11 @@ async function requestJson(url, headers = {}, attempts = 5) {
       const body = await response.text();
 
       if (!response.ok) {
-        const detail = body.slice(0, 500);
-
         const error = new Error(
-          `HTTP ${response.status}: ${detail}`
+          `HTTP ${response.status}: ${body.slice(0, 500)}`
         );
-
         error.status = response.status;
 
-        // Don't retry permanent authentication or bad-request errors.
         if ([400, 401, 403, 404].includes(response.status)) {
           throw error;
         }
@@ -191,17 +168,13 @@ async function requestJson(url, headers = {}, attempts = 5) {
         error: String(error.message || error).slice(0, 500)
       });
 
-      if (
-        error.status &&
-        [400, 401, 403, 404].includes(error.status)
-      ) {
+      if (error.status && [400, 401, 403, 404].includes(error.status)) {
         break;
       }
 
       if (attempt < attempts) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.min(1000 * 2 ** (attempt - 1), 10000))
-        );
+        const delay = Math.min(1500 * 2 ** (attempt - 1), 15000);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
   }
@@ -211,11 +184,10 @@ async function requestJson(url, headers = {}, attempts = 5) {
 
 async function fetchWindowPage(startMs, endMs, offset) {
   const url = new URL("/api/token_trc20/transfers", API_BASE);
-
   url.searchParams.set("contract_address", USDT_CONTRACT);
 
-  // Request confirmed transfers.
-  url.searchParams.set("confirm", "1");
+  // Preserve the existing query setting.
+  url.searchParams.set("confirm", "0");
 
   url.searchParams.set("start_timestamp", String(startMs));
   url.searchParams.set("end_timestamp", String(endMs));
@@ -223,7 +195,6 @@ async function fetchWindowPage(startMs, endMs, offset) {
   url.searchParams.set("limit", String(config.pageSize));
 
   const headers = {};
-
   if (config.apiKey) {
     headers["TRON-PRO-API-KEY"] = config.apiKey;
   }
@@ -254,6 +225,12 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS scanner_transfers_pending_idx
       ON scanner_transfers (created_at)
       WHERE posted_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS scanner_hourly_limits (
+      hour_start TIMESTAMPTZ PRIMARY KEY,
+      target_count INTEGER NOT NULL
+        CHECK (target_count BETWEEN 30 AND 32)
+    );
   `);
 
   const result = await pool.query(
@@ -262,9 +239,7 @@ async function initDb() {
   );
 
   if (result.rowCount === 0) {
-    const initial =
-      nowMs() - config.initialLookbackMinutes * 60_000;
-
+    const initial = nowMs() - config.initialLookbackMinutes * 60000;
     await pool.query(
       `INSERT INTO scanner_state (id, checkpoint_ms)
        VALUES ($1, $2)
@@ -304,7 +279,6 @@ async function scanWindow(startMs, endMs) {
 
   while (pages < config.maxPages) {
     const data = await fetchWindowPage(startMs, endMs, offset);
-
     const rows = Array.isArray(data.token_transfers)
       ? data.token_transfers
       : Array.isArray(data.data)
@@ -316,7 +290,6 @@ async function scanWindow(startMs, endMs) {
 
     for (const tx of rows) {
       const candidate = eligibleTransfer(tx);
-
       if (!candidate) continue;
 
       const inserted = await pool.query(
@@ -345,13 +318,10 @@ async function scanWindow(startMs, endMs) {
         candidates,
         complete: true
       });
-
       return { complete: true };
     }
 
     offset += rows.length;
-
-    // Avoid silently skipping a window that has too many results.
     if (offset >= 10000) break;
   }
 
@@ -368,7 +338,7 @@ async function scanWindow(startMs, endMs) {
 }
 
 function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({
+  return String(value).replace(/[&<>"']/g, char => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -417,61 +387,114 @@ async function sendTelegram(text) {
   const body = await response.json().catch(() => ({}));
 
   if (!response.ok || body.ok !== true) {
-    throw new Error(
+    const error = new Error(
       `Telegram send failed: HTTP ${response.status} ` +
       JSON.stringify(body).slice(0, 500)
     );
+    error.retryAfter = Number(body?.parameters?.retry_after || 0);
+    throw error;
   }
 }
 
+let postingWorkerStarted = false;
+
 async function flushPending() {
-  const result = await pool.query(
-    `SELECT txid, amount_usdt, from_address, to_address
-     FROM scanner_transfers
-     WHERE posted_at IS NULL
-     ORDER BY created_at ASC
-     LIMIT 20`
-  );
+  if (postingWorkerStarted) return;
+  postingWorkerStarted = true;
 
-  for (const row of result.rows) {
-    try {
-      await sendTelegram(postText(row));
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-      await pool.query(
-        `UPDATE scanner_transfers
-         SET posted_at = NOW(), last_error = NULL
-         WHERE txid = $1 AND posted_at IS NULL`,
-        [row.txid]
-      );
+  void (async () => {
+    while (true) {
+      try {
+        const hr = await pool.query(
+          `SELECT date_trunc('hour', NOW()) AS hour_start`
+        );
+        const hourStart = hr.rows[0].hour_start;
 
-      log("info", "Telegram post sent", {
-        txid: row.txid,
-        amount: row.amount_usdt
-      });
-    } catch (error) {
-      await pool.query(
-        `UPDATE scanner_transfers
-         SET attempts = attempts + 1, last_error = $2
-         WHERE txid = $1`,
-        [row.txid, String(error.message || error).slice(0, 1000)]
-      );
+        await pool.query(
+          `INSERT INTO scanner_hourly_limits (hour_start, target_count)
+           VALUES ($1, $2)
+           ON CONFLICT (hour_start) DO NOTHING`,
+          [hourStart, 30 + Math.floor(Math.random() * 3)]
+        );
 
-      log("error", "Telegram post failed", {
-        txid: row.txid,
-        error: String(error.message || error).slice(0, 500)
-      });
+        const tr = await pool.query(
+          `SELECT target_count FROM scanner_hourly_limits
+           WHERE hour_start = $1`,
+          [hourStart]
+        );
+        const target = Number(tr.rows[0].target_count);
 
-      // Avoid hammering Telegram if it is unavailable.
-      break;
+        const cr = await pool.query(
+          `SELECT COUNT(*)::int AS sent
+           FROM scanner_transfers
+           WHERE posted_at >= $1
+             AND posted_at < $1::timestamptz + INTERVAL '1 hour'`,
+          [hourStart]
+        );
+        const sent = Number(cr.rows[0].sent);
+
+        if (sent >= target) {
+          const nextHour = new Date(new Date(hourStart).getTime() + 3600000);
+          await sleep(Math.max(1000, nextHour.getTime() - Date.now() + 1000));
+          continue;
+        }
+
+        const pending = await pool.query(
+          `SELECT txid, amount_usdt, from_address, to_address
+           FROM scanner_transfers
+           WHERE posted_at IS NULL
+           ORDER BY block_timestamp DESC NULLS LAST, created_at DESC
+           LIMIT 1`
+        );
+
+        if (!pending.rows.length) {
+          await sleep(5000);
+          continue;
+        }
+
+        const row = pending.rows[0];
+        await sendTelegram(postText(row));
+
+        await pool.query(
+          `UPDATE scanner_transfers
+           SET posted_at = NOW(), last_error = NULL
+           WHERE txid = $1 AND posted_at IS NULL`,
+          [row.txid]
+        );
+
+        log("info", "Telegram post sent", {
+          txid: row.txid,
+          amount: row.amount_usdt,
+          hourlyTarget: target,
+          hourlySent: sent + 1
+        });
+
+        await sleep(75000 + Math.floor(Math.random() * 75001));
+      } catch (error) {
+        const message = String(error?.message || error);
+        const match = message.match(/"retry_after"\s*:\s*(\d+)/);
+        const retryAfter = Number(error?.retryAfter || (match ? match[1] : 0));
+        const waitMs = retryAfter > 0 ? retryAfter * 1000 + 1000 : 10000;
+
+        log("warn", "Posting worker will retry", {
+          waitMs,
+          error: message.slice(0, 500)
+        });
+
+        await sleep(waitMs);
+      }
     }
-  }
+  })();
 }
 
 async function runCycle() {
+  // Posting runs in the background; scanning does not wait for post intervals.
   await flushPending();
 
   let checkpoint = await getCheckpoint();
-  const safeEnd = nowMs() - 30_000;
+  const safeEnd = nowMs() - 30000;
 
   while (checkpoint < safeEnd) {
     const end = Math.min(
@@ -480,24 +503,15 @@ async function runCycle() {
     );
 
     const result = await scanWindow(checkpoint, end);
-
-    if (!result.complete) {
-      // Retry this window next cycle instead of skipping it.
-      return;
-    }
+    if (!result.complete) return;
 
     await saveCheckpoint(end);
     checkpoint = end;
   }
-
-  await flushPending();
 }
 
 async function main() {
-  if (!config.databaseUrl) {
-    throw new Error("DATABASE_URL is missing");
-  }
-
+  if (!config.databaseUrl) throw new Error("DATABASE_URL is missing");
   if (config.min < 0n || config.max < config.min) {
     throw new Error("Invalid MIN_USDT / MAX_USDT configuration");
   }
@@ -522,9 +536,7 @@ async function main() {
       });
     }
 
-    await new Promise((resolve) =>
-      setTimeout(resolve, config.pollSeconds * 1000)
-    );
+    await new Promise(resolve => setTimeout(resolve, config.pollSeconds * 1000));
   }
 }
 
@@ -540,11 +552,10 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-main().catch(async (error) => {
+main().catch(async error => {
   log("error", "Fatal startup error", {
     error: String(error.stack || error).slice(0, 1500)
   });
-
   await pool.end().catch(() => {});
   process.exit(1);
 });
